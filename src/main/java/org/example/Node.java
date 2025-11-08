@@ -6,7 +6,7 @@ import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Map;
-import java.util.concurrent.*;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Node {
@@ -17,19 +17,19 @@ public class Node {
     private final ServerSocket serverSocket;
     private final AtomicBoolean electionInProgress = new AtomicBoolean(false);
     private final AtomicBoolean gotOk = new AtomicBoolean(false);
-    private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
-    private final ExecutorService handlerPool = Executors.newCachedThreadPool();
     private static final int SOCKET_TIMEOUT_MS = 3000;
     private static final int ELECTION_WAIT_MS = 3000;
     private static final int HEARTBEAT_INTERVAL_MS = 2000;
     private volatile long lastHeartbeatTs = System.currentTimeMillis();
 
+    private volatile boolean running = true;
+    private Thread acceptThread;
+    private Thread heartbeatThread;
+
     public Node(int myId, String configPath) throws IOException {
-        // Carregamos o id passado durante a execução e depois carregamos a configuração
         this.myId = myId;
         loadConfig(configPath);
 
-        //Executamos uma verificação para garantir que o id informado existe na configuração
         InetSocketAddress me = nodes.get(myId);
         if (me == null) throw new IllegalArgumentException("O ID do nó não existe nas configurações");
 
@@ -83,28 +83,32 @@ public class Node {
     }
 
     private void startServer() {
-        Thread t = new Thread(() -> {
-            while (!serverSocket.isClosed()) {
+        acceptThread = new Thread(() -> {
+            while (running && !serverSocket.isClosed()) {
                 try {
                     Socket s = serverSocket.accept();
                     s.setSoTimeout(SOCKET_TIMEOUT_MS);
                     System.out.println("Conexão aceita de " + s.getRemoteSocketAddress());
-                    handlerPool.submit(() -> handleConnection(s));
+                    Thread handler = new Thread(() -> handleConnection(s));
+                    handler.setDaemon(true);
+                    handler.start();
                 } catch (IOException e) {
-                    if (!serverSocket.isClosed()) {
+                    if (running && !serverSocket.isClosed()) {
                         System.err.println("Erro ao aceitar conexão: " + e.getMessage());
+                    } else {
+                        break;
                     }
                 }
             }
         }, "server-accept-thread");
-        t.setDaemon(true);
-        t.start();
+        acceptThread.setDaemon(true);
+        acceptThread.start();
     }
 
     private void handleConnection(Socket s) {
         try (
-            BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()));
-            PrintWriter out = new PrintWriter(s.getOutputStream(), true)
+                BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()));
+                PrintWriter out = new PrintWriter(s.getOutputStream(), true)
         ) {
             String line = in.readLine();
             if (line == null) return;
@@ -116,7 +120,7 @@ public class Node {
                     out.println(Message.format("OK", myId));
                     System.out.println("OK enviado para " + msg.senderId);
                     if (!electionInProgress.get()) {
-                        scheduler.submit(this::startElection);
+                        new Thread(this::startElection, "start-election-from-ELECTION").start();
                     }
                     break;
                 case "OK":
@@ -170,41 +174,56 @@ public class Node {
     }
 
     public void start() {
-        scheduler.schedule(() -> {
-            if (currentCoordinator == -1) {
-                startElection();
+        Thread starter = new Thread(() -> {
+            try {
+                Thread.sleep(1000);
+                if (currentCoordinator == -1) {
+                    startElection();
+                }
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
             }
-        }, 1, TimeUnit.SECONDS);
+        }, "start-delay");
+        starter.setDaemon(true);
+        starter.start();
     }
 
     private void startHeartbeatChecker() {
-        scheduler.scheduleAtFixedRate(() -> {
-            if (!isCoordinator) {
-                long now = System.currentTimeMillis();
-                if (currentCoordinator == -1) {
-                    if (electionInProgress.compareAndSet(false, true)) {
-                        System.out.println("Sem coordenador conhecido, iniciando eleição");
-                        scheduler.submit(this::startElection);
-                    }
-                    return;
+        heartbeatThread = new Thread(() -> {
+            while (running) {
+                try {
+                    Thread.sleep(HEARTBEAT_INTERVAL_MS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
                 }
-                // Tenta obter PONG do coordenador
-                pingLeader();
-
-                // Se já faz tempo sem heartbeat, inicia eleição
-                if (now - lastHeartbeatTs > 3 * HEARTBEAT_INTERVAL_MS) {
-                    if (electionInProgress.compareAndSet(false, true)) {
-                        System.out.println("Suspeita de coordenador inativo, iniciando eleição");
-                        scheduler.submit(this::startElection);
+                if (!isCoordinator) {
+                    long now = System.currentTimeMillis();
+                    if (currentCoordinator == -1) {
+                        if (electionInProgress.compareAndSet(false, true)) {
+                            System.out.println("Sem coordenador conhecido, iniciando eleição");
+                            Thread t = new Thread(this::startElection, "start-election-no-coord");
+                            t.setDaemon(true);
+                            t.start();
+                        }
+                        continue;
+                    }
+                    pingLeader();
+                    if (now - lastHeartbeatTs > 3 * HEARTBEAT_INTERVAL_MS) {
+                        if (electionInProgress.compareAndSet(false, true)) {
+                            System.out.println("Suspeita de coordenador inativo, iniciando eleição");
+                            Thread t = new Thread(this::startElection, "start-election-suspect");
+                            t.setDaemon(true);
+                            t.start();
+                        }
                     }
                 }
             }
-        }, 0, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
+        }, "heartbeat-thread");
+        heartbeatThread.setDaemon(true);
+        heartbeatThread.start();
     }
 
-    /**
-     * Método para verificar se o líder está vivo
-     */
     private void pingLeader() {
         int coord = currentCoordinator;
         if (coord == -1 || coord == myId) return;
@@ -241,7 +260,9 @@ public class Node {
                 if (id > myId) {
                     higherCount++;
                     final int target = id;
-                    handlerPool.submit(() -> sendTo(target, Message.format("ELECTION", myId)));
+                    Thread t = new Thread(() -> sendTo(target, Message.format("ELECTION", myId)), "send-ELECTION-to-" + target);
+                    t.setDaemon(true);
+                    t.start();
                 }
             }
             if (higherCount == 0) {
@@ -286,13 +307,19 @@ public class Node {
     private void broadcast(String payload) {
         for (int id : nodes.keySet()) {
             if (id == myId) continue;
-            handlerPool.submit(() -> sendTo(id, payload));
+            Thread t = new Thread(() -> sendTo(id, payload), "broadcast-to-" + id);
+            t.setDaemon(true);
+            t.start();
         }
     }
 
     public void shutdown() throws IOException {
-        scheduler.shutdownNow();
-        handlerPool.shutdownNow();
-        serverSocket.close();
+        running = false;
+        try {
+            if (acceptThread != null) acceptThread.interrupt();
+            if (heartbeatThread != null) heartbeatThread.interrupt();
+        } finally {
+            serverSocket.close();
+        }
     }
 }
