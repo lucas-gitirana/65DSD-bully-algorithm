@@ -25,30 +25,45 @@ public class Node {
     private volatile long lastHeartbeatTs = System.currentTimeMillis();
 
     public Node(int myId, String configPath) throws IOException {
+        // Carregamos o id passado durante a execução e depois carregamos a configuração
         this.myId = myId;
         loadConfig(configPath);
+
+        //Executamos uma verificação para garantir que o id informado existe na configuração
         InetSocketAddress me = nodes.get(myId);
-        if (me == null) throw new IllegalArgumentException("My id not found in config");
+        if (me == null) throw new IllegalArgumentException("O ID do nó não existe nas configurações");
 
         ServerSocket tmp = null;
         try {
             tmp = new ServerSocket(me.getPort(), 50, me.getAddress());
-            System.out.println("Node " + myId + " bound to configured address " + me.getAddress() + ":" + me.getPort());
         } catch (IOException e) {
-            // fallback para todas as interfaces (0.0.0.0)
             tmp = new ServerSocket(me.getPort());
-            System.out.println("Node " + myId + " could not bind to " + me.getAddress() + ". Falling back to 0.0.0.0:" + me.getPort());
+            System.out.println("Nó " + myId + " não conseguiu conectar ao endereço " + me.getAddress());
         }
         this.serverSocket = tmp;
 
-        System.out.println("Node " + myId + " listening on " + serverSocket.getInetAddress() + ":" + serverSocket.getLocalPort());
-        System.out.println("Known nodes:");
+        System.out.println("Nó " + myId + " escutando no endereço " + serverSocket.getInetAddress() + ":" + serverSocket.getLocalPort());
+        System.out.println("Nós conhecidos:");
         for (Map.Entry<Integer, InetSocketAddress> e : nodes.entrySet()) {
             System.out.println("  id=" + e.getKey() + " addr=" + e.getValue().getAddress() + " port=" + e.getValue().getPort());
         }
 
         startServer();
         startHeartbeatChecker();
+    }
+
+    public static void main(String[] args) throws Exception {
+        if (args.length < 2) {
+            System.err.println("Uso: java org.example.Node <myId> <configFile>");
+            System.exit(1);
+        }
+        int myId = Integer.parseInt(args[0]);
+        String cfg = args[1];
+        Node node = new Node(myId, cfg);
+        node.start();
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            try { node.shutdown(); } catch (IOException ignored) {}
+        }));
     }
 
     private void loadConfig(String path) throws IOException {
@@ -73,12 +88,11 @@ public class Node {
                 try {
                     Socket s = serverSocket.accept();
                     s.setSoTimeout(SOCKET_TIMEOUT_MS);
-                    System.out.println("Accepted connection from " + s.getRemoteSocketAddress());
+                    System.out.println("Conexão aceita de " + s.getRemoteSocketAddress());
                     handlerPool.submit(() -> handleConnection(s));
                 } catch (IOException e) {
-                    // aceitar falhas (podem ocorrer no fechamento)
                     if (!serverSocket.isClosed()) {
-                        System.err.println("Accept error: " + e.getMessage());
+                        System.err.println("Erro ao aceitar conexão: " + e.getMessage());
                     }
                 }
             }
@@ -88,24 +102,26 @@ public class Node {
     }
 
     private void handleConnection(Socket s) {
-        try (BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()));
-             PrintWriter out = new PrintWriter(s.getOutputStream(), true)) {
+        try (
+            BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream()));
+            PrintWriter out = new PrintWriter(s.getOutputStream(), true)
+        ) {
             String line = in.readLine();
             if (line == null) return;
-            System.out.println("Received: " + line + " from " + s.getRemoteSocketAddress());
+            System.out.println("Mensagem: " + line + " recebida de " + s.getRemoteSocketAddress());
             Message msg = Message.parse(line);
             if (msg == null) return;
             switch (msg.type) {
                 case "ELECTION":
                     out.println(Message.format("OK", myId));
-                    System.out.println("Sent OK to " + msg.senderId);
+                    System.out.println("OK enviado para " + msg.senderId);
                     if (!electionInProgress.get()) {
                         scheduler.submit(this::startElection);
                     }
                     break;
                 case "OK":
                     gotOk.set(true);
-                    System.out.println("Got OK from " + msg.senderId);
+                    System.out.println("OK recebido de " + msg.senderId);
                     break;
                 case "COORDINATOR":
                     int coord = msg.senderId;
@@ -113,16 +129,13 @@ public class Node {
                     isCoordinator = (coord == myId);
                     electionInProgress.set(false);
                     lastHeartbeatTs = System.currentTimeMillis();
-                    System.out.println("Coordinator announced: " + coord);
+                    System.out.println("Coordenador anunciado: " + coord);
                     break;
                 case "HEARTBEAT":
                     currentCoordinator = msg.senderId;
                     lastHeartbeatTs = System.currentTimeMillis();
-                    // opcional: log curto
-                    // System.out.println("Heartbeat from " + msg.senderId);
                     break;
                 default:
-                    // ignorar
             }
         } catch (IOException ignored) {
         } finally {
@@ -134,7 +147,7 @@ public class Node {
         InetSocketAddress addr = nodes.get(nodeId);
         if (addr == null) return;
         try (Socket socket = new Socket()) {
-            System.out.println("Sending '" + payload + "' to id=" + nodeId + " addr=" + addr);
+            System.out.println("Enviando '" + payload + "' para id=" + nodeId + " addr=" + addr);
             socket.connect(addr, SOCKET_TIMEOUT_MS);
             socket.setSoTimeout(SOCKET_TIMEOUT_MS);
             PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
@@ -148,8 +161,7 @@ public class Node {
                 }
             }
         } catch (IOException e) {
-            // falha ao conectar - log curto
-            System.err.println("Send to " + nodeId + " failed: " + e.getMessage());
+            System.err.println("Envio ao nó " + nodeId + " falhou: " + e.getMessage());
         }
     }
 
@@ -169,7 +181,7 @@ public class Node {
                 long now = System.currentTimeMillis();
                 if (now - lastHeartbeatTs > 3 * HEARTBEAT_INTERVAL_MS) {
                     if (electionInProgress.compareAndSet(false, true)) {
-                        System.out.println("Suspecting coordinator failure, starting election");
+                        System.out.println("Suspeita de coordenador inativo, iniciando eleição");
                         scheduler.submit(this::startElection);
                     }
                 }
@@ -223,7 +235,7 @@ public class Node {
         isCoordinator = true;
         currentCoordinator = myId;
         electionInProgress.set(false);
-        System.out.println("Becoming coordinator: " + myId);
+        System.out.println("Virando coordenador: " + myId);
         broadcast(Message.format("COORDINATOR", myId));
     }
 
@@ -238,19 +250,5 @@ public class Node {
         scheduler.shutdownNow();
         handlerPool.shutdownNow();
         serverSocket.close();
-    }
-
-    public static void main(String[] args) throws Exception {
-        if (args.length < 2) {
-            System.err.println("Uso: java org.example.Node <myId> <configFile>");
-            System.exit(1);
-        }
-        int myId = Integer.parseInt(args[0]);
-        String cfg = args[1];
-        Node node = new Node(myId, cfg);
-        node.start();
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            try { node.shutdown(); } catch (IOException ignored) {}
-        }));
     }
 }
