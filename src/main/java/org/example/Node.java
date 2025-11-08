@@ -135,6 +135,10 @@ public class Node {
                     currentCoordinator = msg.senderId;
                     lastHeartbeatTs = System.currentTimeMillis();
                     break;
+                case "PING":
+                    out.println(Message.format("PONG", myId));
+                    System.out.println("PONG enviado para " + msg.senderId);
+                    break;
                 default:
             }
         } catch (IOException ignored) {
@@ -175,10 +179,19 @@ public class Node {
 
     private void startHeartbeatChecker() {
         scheduler.scheduleAtFixedRate(() -> {
-            if (isCoordinator) {
-                broadcast(Message.format("HEARTBEAT", myId));
-            } else {
+            if (!isCoordinator) {
                 long now = System.currentTimeMillis();
+                if (currentCoordinator == -1) {
+                    if (electionInProgress.compareAndSet(false, true)) {
+                        System.out.println("Sem coordenador conhecido, iniciando eleição");
+                        scheduler.submit(this::startElection);
+                    }
+                    return;
+                }
+                // Tenta obter PONG do coordenador
+                pingLeader();
+
+                // Se já faz tempo sem heartbeat, inicia eleição
                 if (now - lastHeartbeatTs > 3 * HEARTBEAT_INTERVAL_MS) {
                     if (electionInProgress.compareAndSet(false, true)) {
                         System.out.println("Suspeita de coordenador inativo, iniciando eleição");
@@ -187,6 +200,37 @@ public class Node {
                 }
             }
         }, 0, HEARTBEAT_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Método para verificar se o líder está vivo
+     */
+    private void pingLeader() {
+        int coord = currentCoordinator;
+        if (coord == -1 || coord == myId) return;
+        InetSocketAddress addr = nodes.get(coord);
+        if (addr == null) {
+            currentCoordinator = -1;
+            return;
+        }
+        try (Socket socket = new Socket()) {
+            socket.connect(addr, SOCKET_TIMEOUT_MS);
+            socket.setSoTimeout(SOCKET_TIMEOUT_MS);
+            PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
+            BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            out.println(Message.format("PING", myId));
+            String resp = in.readLine();
+            if (resp != null) {
+                Message r = Message.parse(resp);
+                if (r != null && "PONG".equals(r.type)) {
+                    lastHeartbeatTs = System.currentTimeMillis();
+                    currentCoordinator = coord;
+                    System.out.println("PONG recebido de " + coord);
+                }
+            }
+        } catch (IOException e) {
+            System.err.println("Ping ao coordenador " + coord + " falhou: " + e.getMessage());
+        }
     }
 
     private void startElection() {
