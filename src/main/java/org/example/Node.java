@@ -135,10 +135,6 @@ public class Node {
                     lastHeartbeatTs = System.currentTimeMillis();
                     System.out.println("Coordenador anunciado: " + coord);
                     break;
-                case "HEARTBEAT":
-                    currentCoordinator = msg.senderId;
-                    lastHeartbeatTs = System.currentTimeMillis();
-                    break;
                 case "PING":
                     out.println(Message.format("PONG", myId));
                     System.out.println("PONG enviado para " + msg.senderId);
