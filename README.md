@@ -14,4 +14,5 @@ Executar apontando para a pasta de classes (alterar o id d nó a ser executado 1
 ___
 
 
-Diagrama de classes: ``output/diagram.png``
+Diagrama de classes: ``output/diagram.puml``
+
