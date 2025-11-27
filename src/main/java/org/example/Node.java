@@ -64,6 +64,16 @@ public class Node {
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try { node.shutdown(); } catch (IOException ignored) {}
         }));
+
+        while (true) {
+            try {
+                Thread.sleep(5000); // Espera 5 segundos antes de verificar novamente
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            if (!node.running) break; // Sai do loop se o shutdown for chamado
+        }
     }
 
     private void loadConfig(String path) throws IOException {
